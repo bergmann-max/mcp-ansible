@@ -5,7 +5,7 @@ Provides tools to lint and validate Ansible playbooks and roles.
 File creation is handled directly by the agent via its file tools.
 IMPORTANT: Only stderr for logs, stdout is reserved for JSON-RPC.
 """
-import os, re, sys, json, subprocess, configparser
+import os, re, sys, json, signal, asyncio, subprocess, configparser
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 from mcp import types
@@ -78,40 +78,54 @@ def _validate_input_path(value: str, kind: str, root: Path) -> tuple[Path | None
 
     - Empty value → error
     - Relative path → resolved against `root`
+    - Absolute path → resolved (symlinks/`..` normalized)
     - Must exist on disk
+
+    No traversal guard: absolute paths outside `root` are accepted by design.
+    The server is trusted local code; reject untrusted input upstream.
     """
     if not value:
         return None, {"ok": False, "error": f"{kind} is required"}
     p = Path(value)
-    if not p.is_absolute():
-        p = (root / value).resolve()
+    p = (root / p).resolve() if not p.is_absolute() else p.resolve()
     if not p.exists():
         return None, {"ok": False, "error": f"{kind} does not exist: {value!r}"}
     return p, None
 
 
-def _resolve_inventory(root: Path) -> Path | None:
-    """Resolve inventory path in order of precedence."""
+def _resolve_inventory(root: Path) -> str | None:
+    """Resolve inventory in order of precedence.
+
+    Returns an `ansible -i` argument string — either a single path or a
+    comma-separated list. Honors `ANSIBLE_INVENTORY` (passed through verbatim
+    to support comma-lists) and `ansible.cfg [defaults] inventory` (comma-list
+    resolved against the project root).
+    """
     if env := os.getenv("ANSIBLE_INVENTORY"):
-        return Path(env)
+        return env
     cfg_path = root / "ansible.cfg"
     if cfg_path.exists():
         cfg = configparser.ConfigParser()
         cfg.read(cfg_path)
         if cfg.has_option("defaults", "inventory"):
             raw = cfg.get("defaults", "inventory").strip()
-            resolved = (root / raw).resolve()
-            if resolved.exists():
-                return resolved
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            resolved: list[str] = []
+            for part in parts:
+                rp = (root / part).resolve()
+                if rp.exists():
+                    resolved.append(str(rp))
+            if resolved:
+                return ",".join(resolved)
     for candidate in ["hosts.yml", "hosts.yaml", "hosts.ini",
                       "inventory/hosts.yml", "inventory/hosts.yaml", "inventory/hosts.ini"]:
         p = root / candidate
         if p.exists():
-            return p
+            return str(p)
     return None
 
 
-def _require_inventory(root: Path) -> tuple[Path | None, dict | None]:
+def _require_inventory(root: Path) -> tuple[str | None, dict | None]:
     inv = _resolve_inventory(root)
     if inv is None:
         return None, {
@@ -126,11 +140,48 @@ def _require_inventory(root: Path) -> tuple[Path | None, dict | None]:
     return inv, None
 
 
+def _hardened_env() -> dict:
+    """Env that keeps parsers deterministic regardless of user shell config."""
+    return {
+        **os.environ,
+        "ANSIBLE_STDOUT_CALLBACK": "default",
+        "ANSIBLE_NOCOLOR": "1",
+        "ANSIBLE_FORCE_COLOR": "0",
+    }
+
+
 def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
+    """Run subprocess with hardened env, no stdin, process-group cleanup on timeout.
+
+    - `stdin=DEVNULL` prevents ansible from hanging on sudo/SSH password prompts.
+    - `start_new_session=True` + `os.killpg` reaps ssh children on timeout.
+    - Env hardening pins the stdout callback and disables color so parsers
+      (`_parse_play_recap`, `_parse_list_hosts`, …) stay stable.
+    """
     try:
-        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        return {"ok": r.returncode == 0, "stdout": r.stdout.strip(), "stderr": r.stderr.strip()}
+        proc = subprocess.Popen(
+            cmd, cwd=cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True, env=_hardened_env(),
+            start_new_session=True,
+        )
+    except Exception as e:
+        return {"ok": False, "stdout": "", "stderr": str(e)}
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return {"ok": proc.returncode == 0, "stdout": stdout.strip(), "stderr": stderr.strip()}
     except subprocess.TimeoutExpired:
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+        except ProcessLookupError:
+            pass
         return {
             "ok": False,
             "stdout": "",
@@ -141,7 +192,17 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
             ),
         }
     except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
         return {"ok": False, "stdout": "", "stderr": str(e)}
+
+
+async def _run_async(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
+    """Off-load blocking subprocess to a worker thread so the MCP event loop
+    can keep serving other tool calls in parallel."""
+    return await asyncio.to_thread(_run, cmd, cwd, timeout)
 
 
 # ── Output parsers ────────────────────────────────────────────────────────────
@@ -211,7 +272,7 @@ def _parse_list_hosts(stdout: str) -> list[str]:
             continue
         if in_block:
             stripped = line.strip()
-            if not stripped or stripped.startswith("play #") or ":" in stripped:
+            if not stripped or stripped.startswith("play #"):
                 in_block = False
                 continue
             hosts.append(stripped)
@@ -295,7 +356,7 @@ async def lint_file(
     if profile and profile != "default":
         cmd.extend(["--profile", profile])
     cmd.extend(["--format", "json", str(target)])
-    result = _run(cmd, cwd=root, timeout=60)
+    result = await _run_async(cmd, cwd=root, timeout=300)
     result["findings"] = _parse_lint_findings(result.get("stdout", ""))
     return result
 
@@ -303,6 +364,9 @@ async def lint_file(
 @mcp.tool()
 async def syntax_check(playbook: str, ctx: Context, project_root: str = "") -> dict:
     """Checks the syntax of a playbook without executing it.
+
+    No inventory required — `ansible-playbook --syntax-check` parses the
+    playbook standalone.
 
     Returns `errors: [str]` populated from stderr when syntax invalid.
 
@@ -316,11 +380,8 @@ async def syntax_check(playbook: str, ctx: Context, project_root: str = "") -> d
     target, err = _validate_input_path(playbook, "playbook", root)
     if err:
         return err
-    inv, err = _require_inventory(root)
-    if err:
-        return err
-    result = _run(
-        ["ansible-playbook", "--syntax-check", "-i", str(inv), str(target)],
+    result = await _run_async(
+        ["ansible-playbook", "--syntax-check", str(target)],
         cwd=root, timeout=60,
     )
     if result["ok"]:
@@ -356,10 +417,10 @@ async def diff_check(playbook: str, ctx: Context, project_root: str = "", limit:
     inv, err = _require_inventory(root)
     if err:
         return err
-    cmd = ["ansible-playbook", "--check", "--diff", "-i", str(inv), str(target)]
+    cmd = ["ansible-playbook", "--check", "--diff", "-i", inv, str(target)]
     if limit:
         cmd.extend(["--limit", limit])
-    result = _run(cmd, cwd=root, timeout=300)
+    result = await _run_async(cmd, cwd=root, timeout=300)
     result["recap"] = _parse_play_recap(result.get("stdout", ""))
     return result
 
@@ -383,7 +444,9 @@ async def gather_facts(host: str, ctx: Context, project_root: str = "") -> dict:
     inv, err = _require_inventory(root)
     if err:
         return err
-    result = _run(["ansible", "-i", str(inv), host, "-m", "setup"], cwd=root, timeout=300)
+    result = await _run_async(
+        ["ansible", "-i", inv, host, "-m", "setup"], cwd=root, timeout=300,
+    )
     result["facts"] = _parse_setup_facts(result.get("stdout", "")) if result["ok"] else {}
     return result
 
@@ -408,10 +471,10 @@ async def list_hosts(playbook: str, ctx: Context, project_root: str = "", limit:
     inv, err = _require_inventory(root)
     if err:
         return err
-    cmd = ["ansible-playbook", "--list-hosts", "-i", str(inv), str(target)]
+    cmd = ["ansible-playbook", "--list-hosts", "-i", inv, str(target)]
     if limit:
         cmd.extend(["--limit", limit])
-    result = _run(cmd, cwd=root)
+    result = await _run_async(cmd, cwd=root)
     result["hosts"] = _parse_list_hosts(result.get("stdout", ""))
     return result
 
@@ -435,8 +498,8 @@ async def list_tags(playbook: str, ctx: Context, project_root: str = "") -> dict
     inv, err = _require_inventory(root)
     if err:
         return err
-    result = _run(
-        ["ansible-playbook", "--list-tags", "-i", str(inv), str(target)],
+    result = await _run_async(
+        ["ansible-playbook", "--list-tags", "-i", inv, str(target)],
         cwd=root,
     )
     result["tags"] = _parse_list_tags(result.get("stdout", ""))

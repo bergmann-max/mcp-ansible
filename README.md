@@ -1,10 +1,10 @@
 # mcp-ansible
 
-[![Version](https://img.shields.io/github/v/tag/bergmann-max/mcp-ansible?label=version&color=blue&sort=semver)](https://github.com/bergmann-max/mcp-ansible/tags)
-[![FastMCP](https://img.shields.io/badge/dynamic/toml?url=https://raw.githubusercontent.com/bergmann-max/mcp-ansible/main/pyproject.toml&query=%24.project.dependencies%5B0%5D&label=fastmcp&color=5468FF&logo=python&logoColor=white)](https://github.com/jlowin/fastmcp)
-[![Ansible](https://img.shields.io/badge/dynamic/toml?url=https://raw.githubusercontent.com/bergmann-max/mcp-ansible/main/pyproject.toml&query=%24.project.dependencies%5B1%5D&label=ansible-core&color=red&logo=ansible&logoColor=white)](https://docs.ansible.com/projects/ansible)
-[![ansible-lint](https://img.shields.io/badge/dynamic/toml?url=https://raw.githubusercontent.com/bergmann-max/mcp-ansible/main/pyproject.toml&query=%24.project.dependencies%5B2%5D&label=ansible-lint&color=yellow&logo=ansible&logoColor=white)](https://docs.ansible.com/projects/lint/)
-[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/bergmann-max/mcp-ansible/blob/main/LICENSE)
+[![Version](https://img.shields.io/github/v/tag/bergmann-max/mcp-ansible?label=version&color=blue&sort=semver&style=for-the-badge)](https://github.com/bergmann-max/mcp-ansible/tags)
+[![FastMCP](https://img.shields.io/badge/dynamic/toml?url=https://raw.githubusercontent.com/bergmann-max/mcp-ansible/main/pyproject.toml&query=%24.project.dependencies%5B0%5D&label=fastmcp&color=5468FF&logo=python&logoColor=white&style=for-the-badge)](https://github.com/jlowin/fastmcp)
+[![Ansible](https://img.shields.io/badge/dynamic/toml?url=https://raw.githubusercontent.com/bergmann-max/mcp-ansible/main/pyproject.toml&query=%24.project.dependencies%5B1%5D&label=ansible-core&color=red&logo=ansible&logoColor=white&style=for-the-badge)](https://docs.ansible.com/projects/ansible)
+[![ansible-lint](https://img.shields.io/badge/dynamic/toml?url=https://raw.githubusercontent.com/bergmann-max/mcp-ansible/main/pyproject.toml&query=%24.project.dependencies%5B2%5D&label=ansible-lint&color=yellow&logo=ansible&logoColor=white&style=for-the-badge)](https://docs.ansible.com/projects/lint/)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](https://github.com/bergmann-max/mcp-ansible/blob/main/LICENSE)
 
 Standalone MCP server for linting, syntax-checking, and validating Ansible playbooks and roles.
 
@@ -52,7 +52,7 @@ Add to your MCP client config:
 }
 ```
 
-Pin a tag: `git+https://github.com/bergmann-max/mcp-ansible@v0.1.0`.
+Pin a tag: `git+https://github.com/bergmann-max/mcp-ansible@v0.2.0`.
 
 ## Workspace resolution
 
@@ -66,7 +66,7 @@ In order of precedence:
 2. `ansible.cfg` → `[defaults] inventory`
 3. Fallback files in project root: `hosts.yml`, `hosts.yaml`, `hosts.ini`, `inventory/hosts.yml`, `inventory/hosts.yaml`, `inventory/hosts.ini`
 
-Tools that need an inventory (`syntax_check`, `diff_check`, `gather_facts`, `list_hosts`, `list_tags`) fail when none is found.
+Tools that need an inventory (`diff_check`, `gather_facts`, `list_hosts`, `list_tags`) fail when none is found. `syntax_check` parses the playbook standalone and needs no inventory.
 
 ## Lint profiles
 
