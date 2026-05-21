@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-ansible"
-version = "0.1.0"
+version = "0.2.0"
 description = "Ansible MCP server for linting, syntax-checking, and validating Ansible playbooks and roles"
 requires-python = ">=3.10"
 dependencies = [
