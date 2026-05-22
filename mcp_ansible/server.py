@@ -5,12 +5,23 @@ Provides tools to lint and validate Ansible playbooks and roles.
 File creation is handled directly by the agent via its file tools.
 IMPORTANT: Only stderr for logs, stdout is reserved for JSON-RPC.
 """
-import argparse, logging, os, re, sys, json, signal, asyncio, subprocess, configparser
+
+import argparse
+import asyncio
+import configparser
+import contextlib
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote, urlparse
 
-from fastmcp import FastMCP, Context
+from fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -42,8 +53,10 @@ def _timeout(env_name: str, default: int) -> int:
 # FastMCP 3.x serializes Pydantic models with full JSON-Schema; Kiro's dynamic
 # Power loader uses these schemas to route tool calls.
 
+
 class BaseResult(BaseModel):
     """Common envelope for every tool. Error paths populate `error`."""
+
     ok: bool
     stdout: str = ""
     stderr: str = ""
@@ -92,7 +105,9 @@ def _err(model_cls: type[BaseResult], reason: str) -> BaseResult:
     """
     return model_cls(ok=False, stdout="", stderr=reason, error=reason)
 
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _file_uri_to_path(uri) -> Path | None:
     parsed = urlparse(str(uri))
@@ -102,7 +117,9 @@ def _file_uri_to_path(uri) -> Path | None:
 
 
 async def _resolve_root(
-    ctx: Context, project_root: str, target_hint: str = "",
+    ctx: Context,
+    project_root: str,
+    target_hint: str = "",
 ) -> tuple[Path | None, str | None]:
     """Resolve the workspace.
 
@@ -207,8 +224,14 @@ def _resolve_inventory(root: Path) -> str | None:
                     resolved.append(str(rp))
             if resolved:
                 return ",".join(resolved)
-    for candidate in ["hosts.yml", "hosts.yaml", "hosts.ini",
-                      "inventory/hosts.yml", "inventory/hosts.yaml", "inventory/hosts.ini"]:
+    for candidate in [
+        "hosts.yml",
+        "hosts.yaml",
+        "hosts.ini",
+        "inventory/hosts.yml",
+        "inventory/hosts.yaml",
+        "inventory/hosts.ini",
+    ]:
         p = root / candidate
         if p.exists():
             return str(p)
@@ -247,10 +270,13 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
     """
     try:
         proc = subprocess.Popen(
-            cmd, cwd=cwd,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
-            text=True, env=_hardened_env(),
+            text=True,
+            env=_hardened_env(),
             start_new_session=True,
         )
     except Exception as e:
@@ -279,10 +305,8 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
             ),
         }
     except Exception as e:
-        try:
+        with contextlib.suppress(Exception):
             proc.kill()
-        except Exception:
-            pass
         return {"ok": False, "stdout": "", "stderr": str(e)}
 
 
@@ -293,6 +317,7 @@ async def _run_async(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
 
 
 # ── Output parsers ────────────────────────────────────────────────────────────
+
 
 def _parse_lint_findings(stdout: str) -> list[dict]:
     """Parse ansible-lint --format json output into a compact findings list."""
@@ -309,14 +334,16 @@ def _parse_lint_findings(stdout: str) -> list[dict]:
             line = pos["begin"].get("line")
         elif loc.get("lines"):
             line = loc["lines"].get("begin")
-        findings.append({
-            "rule": it.get("check_name"),
-            "severity": it.get("severity"),
-            "file": loc.get("path"),
-            "line": line,
-            "message": it.get("description"),
-            "url": it.get("url"),
-        })
+        findings.append(
+            {
+                "rule": it.get("check_name"),
+                "severity": it.get("severity"),
+                "file": loc.get("path"),
+                "line": line,
+                "message": it.get("description"),
+                "url": it.get("url"),
+            }
+        )
     return findings
 
 
@@ -402,6 +429,7 @@ def _parse_play_recap(stdout: str) -> dict[str, dict]:
 
 # ── Validation Tools ──────────────────────────────────────────────────────────
 
+
 @mcp.tool
 async def lint_file(
     path: str,
@@ -473,7 +501,8 @@ async def syntax_check(playbook: str, ctx: Context, project_root: str = "") -> S
         return _err(SyntaxResult, err)
     raw = await _run_async(
         ["ansible-playbook", "--syntax-check", str(target)],
-        cwd=root, timeout=60,
+        cwd=root,
+        timeout=60,
     )
     if raw["ok"]:
         errors: list[str] = []
@@ -493,7 +522,10 @@ async def syntax_check(playbook: str, ctx: Context, project_root: str = "") -> S
 
 @mcp.tool
 async def diff_check(
-    playbook: str, ctx: Context, project_root: str = "", limit: str = "",
+    playbook: str,
+    ctx: Context,
+    project_root: str = "",
+    limit: str = "",
 ) -> DiffResult:
     """Runs a playbook in check+diff mode to preview changes without applying them.
 
@@ -560,7 +592,10 @@ async def gather_facts(host: str, ctx: Context, project_root: str = "") -> Facts
 
 @mcp.tool
 async def list_hosts(
-    playbook: str, ctx: Context, project_root: str = "", limit: str = "",
+    playbook: str,
+    ctx: Context,
+    project_root: str = "",
+    limit: str = "",
 ) -> HostsResult:
     """Lists all hosts that would be affected by a playbook run.
 
@@ -625,12 +660,14 @@ async def list_tags(playbook: str, ctx: Context, project_root: str = "") -> Tags
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
+
 class _StderrParser(argparse.ArgumentParser):
     """argparse parser that routes --help and errors to stderr.
 
     stdio transport reserves stdout for JSON-RPC; default argparse writes
     --help to stdout, which would corrupt the first frame.
     """
+
     def _print_message(self, message, file=None):
         # Ignore `file` — argparse's HelpAction passes sys.stdout explicitly.
         # stdio transport reserves stdout for JSON-RPC; force stderr.
@@ -644,11 +681,14 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Ansible MCP server — lint, syntax-check, dry-run validation tools.",
     )
     p.add_argument(
-        "--version", action="store_true",
+        "--version",
+        action="store_true",
         help="print version to stderr and exit",
     )
     p.add_argument(
-        "--transport", default="stdio", choices=["stdio"],
+        "--transport",
+        default="stdio",
+        choices=["stdio"],
         help="transport (default: stdio)",
     )
     return p
