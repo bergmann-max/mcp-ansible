@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-ansible"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Ansible MCP server for linting, syntax-checking, and validating Ansible playbooks and roles"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.26.0",
+    "fastmcp>=3",
     "ansible-core>=2.20.0",
     "ansible-lint>=25.6.0",
 ]
@@ -16,5 +16,9 @@ dependencies = [
 [project.scripts]
 mcp-ansible = "mcp_ansible.server:main"
 
+[tool.hatch.version]
+path = "mcp_ansible/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_ansible"]
+include = ["mcp_ansible/py.typed"]

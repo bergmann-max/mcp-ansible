@@ -5,11 +5,12 @@ Provides tools to lint and validate Ansible playbooks and roles.
 File creation is handled directly by the agent via its file tools.
 IMPORTANT: Only stderr for logs, stdout is reserved for JSON-RPC.
 """
-import os, re, sys, json, signal, asyncio, subprocess, configparser
+import argparse, os, re, sys, json, signal, asyncio, subprocess, configparser
 from pathlib import Path
 from urllib.parse import urlparse, unquote
-from mcp import types
-from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import FastMCP, Context
+
+from . import __version__
 
 mcp = FastMCP("ansible")
 
@@ -31,17 +32,14 @@ async def _resolve_root(ctx: Context, project_root: str) -> tuple[Path | None, d
     1. MCP roots — first usable file:// root, when the client advertises the capability.
     2. Explicit project_root argument — fallback for clients without roots support.
     """
-    if ctx.session.check_client_capability(
-        types.ClientCapabilities(roots=types.RootsCapability())
-    ):
-        try:
-            result = await ctx.session.list_roots()
-            for r in result.roots:
-                p = _file_uri_to_path(r.uri)
-                if p and p.is_absolute() and p.exists():
-                    return p, None
-        except Exception as e:
-            print(f"[mcp-ansible] roots lookup failed: {e}", file=sys.stderr)
+    try:
+        roots = await ctx.list_roots()
+        for r in roots:
+            p = _file_uri_to_path(r.uri)
+            if p and p.is_absolute() and p.exists():
+                return p, None
+    except Exception as e:
+        print(f"[mcp-ansible] roots lookup failed: {e}", file=sys.stderr)
 
     if not project_root:
         return None, {
@@ -315,7 +313,7 @@ def _parse_play_recap(stdout: str) -> dict[str, dict]:
 
 # ── Validation Tools ──────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool
 async def lint_file(
     path: str,
     ctx: Context,
@@ -361,7 +359,7 @@ async def lint_file(
     return result
 
 
-@mcp.tool()
+@mcp.tool
 async def syntax_check(playbook: str, ctx: Context, project_root: str = "") -> dict:
     """Checks the syntax of a playbook without executing it.
 
@@ -396,7 +394,7 @@ async def syntax_check(playbook: str, ctx: Context, project_root: str = "") -> d
     return result
 
 
-@mcp.tool()
+@mcp.tool
 async def diff_check(playbook: str, ctx: Context, project_root: str = "", limit: str = "") -> dict:
     """Runs a playbook in check+diff mode to preview changes without applying them.
 
@@ -425,7 +423,7 @@ async def diff_check(playbook: str, ctx: Context, project_root: str = "", limit:
     return result
 
 
-@mcp.tool()
+@mcp.tool
 async def gather_facts(host: str, ctx: Context, project_root: str = "") -> dict:
     """Collects Ansible facts from a host or group using the setup module.
 
@@ -451,7 +449,7 @@ async def gather_facts(host: str, ctx: Context, project_root: str = "") -> dict:
     return result
 
 
-@mcp.tool()
+@mcp.tool
 async def list_hosts(playbook: str, ctx: Context, project_root: str = "", limit: str = "") -> dict:
     """Lists all hosts that would be affected by a playbook run.
 
@@ -479,7 +477,7 @@ async def list_hosts(playbook: str, ctx: Context, project_root: str = "", limit:
     return result
 
 
-@mcp.tool()
+@mcp.tool
 async def list_tags(playbook: str, ctx: Context, project_root: str = "") -> dict:
     """Lists all tags defined in a playbook.
 
@@ -508,8 +506,42 @@ async def list_tags(playbook: str, ctx: Context, project_root: str = "") -> dict
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
+class _StderrParser(argparse.ArgumentParser):
+    """argparse parser that routes --help and errors to stderr.
+
+    stdio transport reserves stdout for JSON-RPC; default argparse writes
+    --help to stdout, which would corrupt the first frame.
+    """
+    def _print_message(self, message, file=None):
+        # Ignore `file` — argparse's HelpAction passes sys.stdout explicitly.
+        # stdio transport reserves stdout for JSON-RPC; force stderr.
+        if message:
+            sys.stderr.write(message)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = _StderrParser(
+        prog="mcp-ansible",
+        description="Ansible MCP server — lint, syntax-check, dry-run validation tools.",
+    )
+    p.add_argument(
+        "--version", action="store_true",
+        help="print version to stderr and exit",
+    )
+    p.add_argument(
+        "--transport", default="stdio", choices=["stdio"],
+        help="transport (default: stdio)",
+    )
+    return p
+
+
 def main():
-    mcp.run(transport="stdio")
+    parser = _build_parser()
+    args = parser.parse_args()
+    if args.version:
+        print(f"mcp-ansible {__version__}", file=sys.stderr)
+        sys.exit(0)
+    mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":
