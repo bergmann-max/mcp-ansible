@@ -18,7 +18,10 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypedDict
+
+if TYPE_CHECKING:
+    from _typeshed import SupportsWrite
 from urllib.parse import unquote, urlparse
 
 from fastmcp import Context, FastMCP
@@ -37,6 +40,18 @@ _LINT_PROFILES = {"default", "min", "basic", "moderate", "safety", "shared", "pr
 _STRICT_ROOT = os.getenv("MCP_ANSIBLE_STRICT_ROOT") == "1"
 
 
+class ToolInputError(Exception):
+    """Raised by input-resolution helpers when input cannot be turned into a
+    usable path or inventory string. Caught at the tool boundary and rendered
+    as a structured `_err(...)` response."""
+
+
+class _RunResult(TypedDict):
+    ok: bool
+    stdout: str
+    stderr: str
+
+
 def _timeout(env_name: str, default: int) -> int:
     """Read a per-tool timeout from env, fall back to `default` on unset/garbage."""
     raw = os.getenv(env_name)
@@ -50,8 +65,8 @@ def _timeout(env_name: str, default: int) -> int:
 
 
 # ── Structured response models ────────────────────────────────────────────────
-# FastMCP 3.x serializes Pydantic models with full JSON-Schema; Kiro's dynamic
-# Power loader uses these schemas to route tool calls.
+# FastMCP 3.x serializes Pydantic models with full JSON-Schema; downstream MCP
+# clients use these schemas to route tool calls.
 
 
 class BaseResult(BaseModel):
@@ -96,7 +111,7 @@ class TagsResult(BaseResult):
     tags: list[str] = Field(default_factory=list)
 
 
-def _err(model_cls: type[BaseResult], reason: str) -> BaseResult:
+def _err[R: BaseResult](model_cls: type[R], reason: str) -> R:
     """Build a failure response for the given tool's result model.
 
     All error paths share the shape `{ok=False, stdout="", stderr=reason,
@@ -109,7 +124,7 @@ def _err(model_cls: type[BaseResult], reason: str) -> BaseResult:
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _file_uri_to_path(uri) -> Path | None:
+def _file_uri_to_path(uri: object) -> Path | None:
     parsed = urlparse(str(uri))
     if parsed.scheme != "file":
         return None
@@ -120,7 +135,7 @@ async def _resolve_root(
     ctx: Context,
     project_root: str,
     target_hint: str = "",
-) -> tuple[Path | None, str | None]:
+) -> Path:
     """Resolve the workspace.
 
     Priority:
@@ -129,7 +144,7 @@ async def _resolve_root(
        prefer the root that is a parent of the target.
     2. Explicit project_root argument — fallback for clients without roots support.
 
-    Returns `(root, None)` on success or `(None, error_message)` on failure.
+    Raises `ToolInputError` if no usable root can be derived.
     """
     try:
         roots = await ctx.list_roots()
@@ -138,7 +153,6 @@ async def _resolve_root(
             p = _file_uri_to_path(r.uri)
             if p and p.is_absolute() and p.exists():
                 candidates.append(p)
-        # If hint is absolute, prefer the root that contains the target.
         if candidates and target_hint:
             hint = Path(target_hint)
             if hint.is_absolute():
@@ -146,33 +160,33 @@ async def _resolve_root(
                 for c in candidates:
                     try:
                         hint_resolved.relative_to(c.resolve())
-                        return c, None
+                        return c
                     except ValueError:
                         continue
         if candidates:
-            return candidates[0], None
+            return candidates[0]
     except Exception as e:
         log.warning("roots lookup failed: %s", e)
 
     if not project_root:
-        return None, (
+        raise ToolInputError(
             "Workspace not resolved. Either the client must advertise the MCP "
             "'roots' capability, or pass project_root as an absolute path."
         )
     if project_root.startswith("${") or project_root.startswith("$("):
-        return None, (
+        raise ToolInputError(
             f"project_root contains an unresolved variable: {project_root!r}. "
             "Pass the actual absolute path, e.g. '/home/user/my-project'."
         )
     p = Path(project_root)
     if not p.is_absolute():
-        return None, f"project_root must be an absolute path, got: {project_root!r}"
+        raise ToolInputError(f"project_root must be an absolute path, got: {project_root!r}")
     if not p.exists():
-        return None, f"project_root does not exist: {project_root!r}"
-    return p, None
+        raise ToolInputError(f"project_root does not exist: {project_root!r}")
+    return p
 
 
-def _validate_input_path(value: str, kind: str, root: Path) -> tuple[Path | None, str | None]:
+def _validate_input_path(value: str, kind: str, root: Path) -> Path:
     """Validate a user-supplied file or directory path argument.
 
     - Empty value → error
@@ -182,22 +196,24 @@ def _validate_input_path(value: str, kind: str, root: Path) -> tuple[Path | None
 
     Default: absolute paths outside `root` are accepted (trusted local code).
     Set MCP_ANSIBLE_STRICT_ROOT=1 to reject paths that resolve outside `root`.
+
+    Raises `ToolInputError` on any validation failure.
     """
     if not value:
-        return None, f"{kind} is required"
+        raise ToolInputError(f"{kind} is required")
     p = Path(value)
     p = (root / p).resolve() if not p.is_absolute() else p.resolve()
     if not p.exists():
-        return None, f"{kind} does not exist: {value!r}"
+        raise ToolInputError(f"{kind} does not exist: {value!r}")
     if _STRICT_ROOT:
         try:
             p.relative_to(root.resolve())
-        except ValueError:
-            return None, (
+        except ValueError as e:
+            raise ToolInputError(
                 f"{kind} resolves outside project root (strict mode): {value!r}. "
                 "Unset MCP_ANSIBLE_STRICT_ROOT to allow paths outside the root."
-            )
-    return p, None
+            ) from e
+    return p
 
 
 def _resolve_inventory(root: Path) -> str | None:
@@ -238,19 +254,20 @@ def _resolve_inventory(root: Path) -> str | None:
     return None
 
 
-def _require_inventory(root: Path) -> tuple[str | None, str | None]:
+def _require_inventory(root: Path) -> str:
+    """Resolve inventory, raise `ToolInputError` if none can be found."""
     inv = _resolve_inventory(root)
     if inv is None:
-        return None, (
+        raise ToolInputError(
             "No inventory found. Provide one via:\n"
             "  1. ANSIBLE_INVENTORY env var\n"
             "  2. ansible.cfg [defaults] inventory\n"
             "  3. hosts.yml or hosts.ini in project root"
         )
-    return inv, None
+    return inv
 
 
-def _hardened_env() -> dict:
+def _hardened_env() -> dict[str, str]:
     """Env that keeps parsers deterministic regardless of user shell config."""
     return {
         **os.environ,
@@ -260,7 +277,7 @@ def _hardened_env() -> dict:
     }
 
 
-def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
+def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> _RunResult:
     """Run subprocess with hardened env, no stdin, process-group cleanup on timeout.
 
     - `stdin=DEVNULL` prevents ansible from hanging on sudo/SSH password prompts.
@@ -310,7 +327,7 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
         return {"ok": False, "stdout": "", "stderr": str(e)}
 
 
-async def _run_async(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
+async def _run_async(cmd: list[str], cwd: Path, timeout: int = 60) -> _RunResult:
     """Off-load blocking subprocess to a worker thread so the MCP event loop
     can keep serving other tool calls in parallel."""
     return await asyncio.to_thread(_run, cmd, cwd, timeout)
@@ -319,27 +336,55 @@ async def _run_async(cmd: list[str], cwd: Path, timeout: int = 60) -> dict:
 # ── Output parsers ────────────────────────────────────────────────────────────
 
 
-def _parse_lint_findings(stdout: str) -> list[dict]:
-    """Parse ansible-lint --format json output into a compact findings list."""
-    try:
-        items = json.loads(stdout) if stdout else []
-    except json.JSONDecodeError:
+def _parse_lint_findings(stdout: str) -> list[dict[str, Any]]:
+    """Parse ansible-lint --format codeclimate output into a compact findings list.
+
+    Tolerates two on-the-wire shapes:
+    - JSON array (current ansible-lint behaviour): one top-level list of items.
+    - NDJSON (strict CodeClimate spec): one JSON object per line.
+    """
+    if not stdout:
         return []
-    findings = []
+    items: list[Any]
+    try:
+        parsed = json.loads(stdout)
+        if isinstance(parsed, list):
+            items = parsed
+        elif isinstance(parsed, dict):
+            items = [parsed]
+        else:
+            log.warning("unexpected ansible-lint payload shape: %s", type(parsed).__name__)
+            return []
+    except json.JSONDecodeError:
+        items = []
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if not items:
+            log.warning("ansible-lint payload unparseable: %r", stdout[:200])
+            return []
+    findings: list[dict[str, Any]] = []
     for it in items:
+        if not isinstance(it, dict):
+            continue
         loc = it.get("location") or {}
-        line = None
+        line_no: int | None = None
         pos = loc.get("positions") or {}
         if pos.get("begin"):
-            line = pos["begin"].get("line")
+            line_no = pos["begin"].get("line")
         elif loc.get("lines"):
-            line = loc["lines"].get("begin")
+            line_no = loc["lines"].get("begin")
         findings.append(
             {
                 "rule": it.get("check_name"),
                 "severity": it.get("severity"),
                 "file": loc.get("path"),
-                "line": line,
+                "line": line_no,
                 "message": it.get("description"),
                 "url": it.get("url"),
             }
@@ -347,14 +392,14 @@ def _parse_lint_findings(stdout: str) -> list[dict]:
     return findings
 
 
-def _parse_setup_facts(stdout: str) -> dict[str, dict]:
+def _parse_setup_facts(stdout: str) -> dict[str, dict[str, Any]]:
     """Parse `ansible <host_or_group> -m setup` output.
 
     Output contains one block per host: 'hostname | STATUS => {json}'.
     Returns `{hostname: facts_dict}` for SUCCESS hosts only. UNREACHABLE!/FAILED!
     hosts are skipped. Empty dict if no parseable blocks.
     """
-    results: dict[str, dict] = {}
+    results: dict[str, dict[str, Any]] = {}
     pattern = re.compile(
         r"^(\S+)\s*\|\s*(SUCCESS|UNREACHABLE!|FAILED!)\s*=>\s*",
         re.MULTILINE,
@@ -404,23 +449,23 @@ def _parse_list_tags(stdout: str) -> list[str]:
     return sorted(tags)
 
 
-def _parse_play_recap(stdout: str) -> dict[str, dict]:
+def _parse_play_recap(stdout: str) -> dict[str, dict[str, int]]:
     """Parse the PLAY RECAP block from ansible-playbook output."""
-    recap: dict[str, dict] = {}
+    recap: dict[str, dict[str, int]] = {}
     in_recap = False
-    for line in stdout.splitlines():
-        if line.startswith("PLAY RECAP"):
+    for raw_line in stdout.splitlines():
+        if raw_line.startswith("PLAY RECAP"):
             in_recap = True
             continue
         if in_recap:
-            line = line.strip()
+            line = raw_line.strip()
             if not line:
                 continue
             m = re.match(r"^(\S+)\s*:\s*(.+)$", line)
             if not m:
                 continue
             host = m.group(1)
-            stats = {}
+            stats: dict[str, int] = {}
             for kv in re.finditer(r"(\w+)=(\d+)", m.group(2)):
                 stats[kv.group(1)] = int(kv.group(2))
             recap[host] = stats
@@ -453,7 +498,6 @@ async def lint_file(
                       shared, production. Use "default" (or empty) to respect
                       the project's .ansible-lint config instead.
     """
-    # Normalize empty profile to canonical "default" token.
     if profile == "":
         profile = "default"
     if profile not in _LINT_PROFILES:
@@ -461,16 +505,15 @@ async def lint_file(
             LintResult,
             f"unknown profile: {profile!r}. Allowed: {sorted(_LINT_PROFILES)}",
         )
-    root, err = await _resolve_root(ctx, project_root, target_hint=path)
-    if err:
-        return _err(LintResult, err)
-    target, err = _validate_input_path(path, "path", root)
-    if err:
-        return _err(LintResult, err)
+    try:
+        root = await _resolve_root(ctx, project_root, target_hint=path)
+        target = _validate_input_path(path, "path", root)
+    except ToolInputError as e:
+        return _err(LintResult, str(e))
     cmd = ["ansible-lint"]
     if profile != "default":
         cmd.extend(["--profile", profile])
-    cmd.extend(["--format", "json", str(target)])
+    cmd.extend(["--format", "codeclimate", str(target)])
     raw = await _run_async(cmd, cwd=root, timeout=_timeout("MCP_ANSIBLE_TIMEOUT_LINT", 300))
     return LintResult(
         ok=raw["ok"],
@@ -493,25 +536,25 @@ async def syntax_check(playbook: str, ctx: Context, project_root: str = "") -> S
         playbook:     Path to the playbook file (absolute, or relative to root).
         project_root: Optional. Absolute path to the Ansible project root.
     """
-    root, err = await _resolve_root(ctx, project_root, target_hint=playbook)
-    if err:
-        return _err(SyntaxResult, err)
-    target, err = _validate_input_path(playbook, "playbook", root)
-    if err:
-        return _err(SyntaxResult, err)
+    try:
+        root = await _resolve_root(ctx, project_root, target_hint=playbook)
+        target = _validate_input_path(playbook, "playbook", root)
+    except ToolInputError as e:
+        return _err(SyntaxResult, str(e))
     raw = await _run_async(
         ["ansible-playbook", "--syntax-check", str(target)],
         cwd=root,
-        timeout=60,
+        timeout=_timeout("MCP_ANSIBLE_TIMEOUT_SYNTAX", 60),
     )
-    if raw["ok"]:
-        errors: list[str] = []
-    else:
-        errors = [
+    errors: list[str] = (
+        []
+        if raw["ok"]
+        else [
             line.strip()
             for line in raw["stderr"].splitlines()
             if line.strip() and not line.strip().startswith("[WARNING]")
         ]
+    )
     return SyntaxResult(
         ok=raw["ok"],
         stdout=raw["stdout"],
@@ -537,15 +580,12 @@ async def diff_check(
         project_root: Optional. Absolute path to the Ansible project root.
         limit:        Optional host limit, e.g. 'webservers' or 'web01.example.com'
     """
-    root, err = await _resolve_root(ctx, project_root, target_hint=playbook)
-    if err:
-        return _err(DiffResult, err)
-    target, err = _validate_input_path(playbook, "playbook", root)
-    if err:
-        return _err(DiffResult, err)
-    inv, err = _require_inventory(root)
-    if err:
-        return _err(DiffResult, err)
+    try:
+        root = await _resolve_root(ctx, project_root, target_hint=playbook)
+        target = _validate_input_path(playbook, "playbook", root)
+        inv = _require_inventory(root)
+    except ToolInputError as e:
+        return _err(DiffResult, str(e))
     cmd = ["ansible-playbook", "--check", "--diff", "-i", inv, str(target)]
     if limit:
         cmd.extend(["--limit", limit])
@@ -571,12 +611,11 @@ async def gather_facts(host: str, ctx: Context, project_root: str = "") -> Facts
     """
     if not host:
         return _err(FactsResult, "host is required")
-    root, err = await _resolve_root(ctx, project_root)
-    if err:
-        return _err(FactsResult, err)
-    inv, err = _require_inventory(root)
-    if err:
-        return _err(FactsResult, err)
+    try:
+        root = await _resolve_root(ctx, project_root)
+        inv = _require_inventory(root)
+    except ToolInputError as e:
+        return _err(FactsResult, str(e))
     raw = await _run_async(
         ["ansible", "-i", inv, host, "-m", "setup"],
         cwd=root,
@@ -606,19 +645,16 @@ async def list_hosts(
         project_root: Optional. Absolute path to the Ansible project root.
         limit:        Optional host limit, e.g. 'webservers' or 'web01.example.com'
     """
-    root, err = await _resolve_root(ctx, project_root, target_hint=playbook)
-    if err:
-        return _err(HostsResult, err)
-    target, err = _validate_input_path(playbook, "playbook", root)
-    if err:
-        return _err(HostsResult, err)
-    inv, err = _require_inventory(root)
-    if err:
-        return _err(HostsResult, err)
+    try:
+        root = await _resolve_root(ctx, project_root, target_hint=playbook)
+        target = _validate_input_path(playbook, "playbook", root)
+        inv = _require_inventory(root)
+    except ToolInputError as e:
+        return _err(HostsResult, str(e))
     cmd = ["ansible-playbook", "--list-hosts", "-i", inv, str(target)]
     if limit:
         cmd.extend(["--limit", limit])
-    raw = await _run_async(cmd, cwd=root)
+    raw = await _run_async(cmd, cwd=root, timeout=_timeout("MCP_ANSIBLE_TIMEOUT_LIST", 60))
     return HostsResult(
         ok=raw["ok"],
         stdout=raw["stdout"],
@@ -637,18 +673,16 @@ async def list_tags(playbook: str, ctx: Context, project_root: str = "") -> Tags
         playbook:     Path to the playbook file (absolute, or relative to root).
         project_root: Optional. Absolute path to the Ansible project root.
     """
-    root, err = await _resolve_root(ctx, project_root, target_hint=playbook)
-    if err:
-        return _err(TagsResult, err)
-    target, err = _validate_input_path(playbook, "playbook", root)
-    if err:
-        return _err(TagsResult, err)
-    inv, err = _require_inventory(root)
-    if err:
-        return _err(TagsResult, err)
+    try:
+        root = await _resolve_root(ctx, project_root, target_hint=playbook)
+        target = _validate_input_path(playbook, "playbook", root)
+        inv = _require_inventory(root)
+    except ToolInputError as e:
+        return _err(TagsResult, str(e))
     raw = await _run_async(
         ["ansible-playbook", "--list-tags", "-i", inv, str(target)],
         cwd=root,
+        timeout=_timeout("MCP_ANSIBLE_TIMEOUT_LIST", 60),
     )
     return TagsResult(
         ok=raw["ok"],
@@ -668,7 +702,7 @@ class _StderrParser(argparse.ArgumentParser):
     --help to stdout, which would corrupt the first frame.
     """
 
-    def _print_message(self, message, file=None):
+    def _print_message(self, message: str, file: "SupportsWrite[str] | None" = None) -> None:
         # Ignore `file` — argparse's HelpAction passes sys.stdout explicitly.
         # stdio transport reserves stdout for JSON-RPC; force stderr.
         if message:
@@ -712,15 +746,16 @@ def _configure_logging() -> None:
     own.propagate = False
 
     # Third-party libraries that may default to stdout via root logger.
-    # Pin them to the same stderr handler and suppress below WARNING.
-    for name in ("ansible", "urllib3"):
+    # `fastmcp` included because the FastMCP startup banner and server logs
+    # would otherwise inherit root-handler routing.
+    for name in ("fastmcp", "ansible", "urllib3"):
         third = logging.getLogger(name)
         third.handlers = [handler]
         third.setLevel(logging.WARNING)
         third.propagate = False
 
 
-def main():
+def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
     if args.version:

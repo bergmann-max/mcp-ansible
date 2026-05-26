@@ -10,18 +10,20 @@ license = { file = "LICENSE" }
 authors = [
     { name = "Max Bergmann" },
 ]
-keywords = ["mcp", "ansible"]
+keywords = ["mcp", "ansible", "playbook", "lint"]
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=3",
-    "ansible-core>=2.21.0",
-    "ansible-lint>=26.4.0",
+    "ansible-core>=2.20.0",
+    "ansible-lint>=25.6.0",
 ]
 
 [project.scripts]
 mcp-ansible = "mcp_ansible.server:main"
 
 [project.urls]
+Homepage = "https://github.com/bergmann-max/mcp-ansible"
+Source = "https://github.com/bergmann-max/mcp-ansible"
 Issues = "https://github.com/bergmann-max/mcp-ansible/issues"
 
 [project.optional-dependencies]
@@ -52,6 +54,7 @@ line-ending = "lf"
 python_version = "3.12"
 strict = true
 warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -63,7 +66,11 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not slow'"
+markers = [
+    "slow: opt-in integration/handshake tests (run with `pytest -m slow`)",
+]
 
 [tool.coverage.run]
 source = ["mcp_ansible"]
